@@ -24,9 +24,9 @@ abstract contract Context {
     return msg.sender;
   }
 
-  function _msgData() internal view virtual returns (bytes memory) {
+  function _msgData() internal view virtual returns (bytes calldata) {
     this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691
-    return msg.data;
+    return msg.data[:msg.data.length - 20];
   }
 }
 
@@ -1484,8 +1484,44 @@ abstract contract GovernancePowerWithSnapshot is GovernancePowerDelegationERC20 
   }
 }
 
-// File contracts/stake/StakedTokenV3.sol
+// OpenZeppelin Contracts v4.4.1 (metatx/ERC2771Context.sol)
+pragma solidity ^0.7.5;
 
+/**
+ * @dev Context variant with ERC2771 support.
+ */
+abstract contract ERC2771Context is Context, VersionedInitializable {
+    address internal _trustedForwarder;
+
+    function initializeTrustedForwarder( address trustedForwarder ) public initializer {
+      _trustedForwarder = trustedForwarder;
+    }
+
+    function isTrustedForwarder(address forwarder) public view virtual returns (bool) {
+        return forwarder == _trustedForwarder;
+    }
+
+    function _msgSender() internal view virtual override returns (address payable sender) {
+        if (isTrustedForwarder(msg.sender)) {
+            // The assembly code is more direct than the Solidity version using `abi.decode`.
+            assembly {
+                sender := shr(96, calldataload(sub(calldatasize(), 20)))
+            }
+        } else {
+            return super._msgSender();
+        }
+    }
+
+    function _msgData() internal view virtual override returns (bytes calldata) {
+        if (isTrustedForwarder(msg.sender)) {
+             return msg.data[:msg.data.length - 20];
+        } else {
+            return super._msgData();
+        }
+    }
+}
+
+// File contracts/stake/StakedTokenV3.sol
 /**
  * @title StakedToken
  * @notice Contract to stake Aave token, tokenize the position and get rewards, inheriting from a distribution manager contract
@@ -1495,13 +1531,14 @@ contract StakedTokenBptRev2 is
   IStakedAave,
   GovernancePowerWithSnapshot,
   VersionedInitializable,
-  AaveDistributionManager
+  AaveDistributionManager,
+  ERC2771Context
 {
   using SafeMath for uint256;
   using SafeERC20 for IERC20;
 
   /// @dev Start of Storage layout from StakedToken v1
-  uint256 public constant REVISION = 2;
+  uint256 public constant REVISION = 1;
 
   IERC20 public immutable STAKED_TOKEN;
   IERC20 public immutable REWARD_TOKEN;
@@ -1571,8 +1608,11 @@ contract StakedTokenBptRev2 is
   function initialize(
     string calldata name,
     string calldata symbol,
-    uint8 decimals
+    uint8 decimals,
+    address _trustedForwarder
   ) external initializer {
+    require(_trustedForwarder != address(0), "TrustForwarder address can't be 0");
+    
     uint256 chainId;
 
     //solium-disable-next-line
@@ -1589,11 +1629,21 @@ contract StakedTokenBptRev2 is
         address(this)
       )
     );
+
+    initializeTrustedForwarder(_trustedForwarder);
     if (REVISION == 1) {
       _name = name;
       _symbol = symbol;
       _setupDecimals(decimals);
     }
+  }
+
+  function _msgSender() internal view override(ERC2771Context, Context) returns (address payable sender) {
+    return ERC2771Context._msgSender();
+  }
+
+  function _msgData() internal view override(ERC2771Context, Context) returns (bytes calldata) {
+    return ERC2771Context._msgData();
   }
 
   function stake(address onBehalfOf, uint256 amount) external override {
@@ -1610,9 +1660,9 @@ contract StakedTokenBptRev2 is
     stakersCooldowns[onBehalfOf] = getNextCooldownTimestamp(0, amount, onBehalfOf, balanceOfUser);
 
     _mint(onBehalfOf, amount);
-    IERC20(STAKED_TOKEN).safeTransferFrom(msg.sender, address(this), amount);
+    IERC20(STAKED_TOKEN).safeTransferFrom(_msgSender(), address(this), amount);
 
-    emit Staked(msg.sender, onBehalfOf, amount);
+    emit Staked(_msgSender(), onBehalfOf, amount);
   }
 
   /**
@@ -1623,7 +1673,7 @@ contract StakedTokenBptRev2 is
   function redeem(address to, uint256 amount) external override {
     require(amount != 0, 'INVALID_ZERO_AMOUNT');
     //solium-disable-next-line
-    uint256 cooldownStartTimestamp = stakersCooldowns[msg.sender];
+    uint256 cooldownStartTimestamp = stakersCooldowns[_msgSender()];
     require(
       block.timestamp > cooldownStartTimestamp.add(COOLDOWN_SECONDS),
       'INSUFFICIENT_COOLDOWN'
@@ -1632,21 +1682,21 @@ contract StakedTokenBptRev2 is
       block.timestamp.sub(cooldownStartTimestamp.add(COOLDOWN_SECONDS)) <= UNSTAKE_WINDOW,
       'UNSTAKE_WINDOW_FINISHED'
     );
-    uint256 balanceOfMessageSender = balanceOf(msg.sender);
+    uint256 balanceOfMessageSender = balanceOf(_msgSender());
 
     uint256 amountToRedeem = (amount > balanceOfMessageSender) ? balanceOfMessageSender : amount;
 
-    _updateCurrentUnclaimedRewards(msg.sender, balanceOfMessageSender, true);
+    _updateCurrentUnclaimedRewards(_msgSender(), balanceOfMessageSender, true);
 
-    _burn(msg.sender, amountToRedeem);
+    _burn(_msgSender(), amountToRedeem);
 
     if (balanceOfMessageSender.sub(amountToRedeem) == 0) {
-      stakersCooldowns[msg.sender] = 0;
+      stakersCooldowns[_msgSender()] = 0;
     }
 
     IERC20(STAKED_TOKEN).safeTransfer(to, amountToRedeem);
 
-    emit Redeem(msg.sender, to, amountToRedeem);
+    emit Redeem(_msgSender(), to, amountToRedeem);
   }
 
   /**
@@ -1654,11 +1704,11 @@ contract StakedTokenBptRev2 is
    * - It can't be called if the user is not staking
    **/
   function cooldown() external override {
-    require(balanceOf(msg.sender) != 0, 'INVALID_BALANCE_ON_COOLDOWN');
+    require(balanceOf(_msgSender()) != 0, 'INVALID_BALANCE_ON_COOLDOWN');
     //solium-disable-next-line
-    stakersCooldowns[msg.sender] = block.timestamp;
+    stakersCooldowns[_msgSender()] = block.timestamp;
 
-    emit Cooldown(msg.sender);
+    emit Cooldown(_msgSender());
   }
 
   /**
@@ -1668,14 +1718,14 @@ contract StakedTokenBptRev2 is
    **/
   function claimRewards(address to, uint256 amount) external override {
     uint256 newTotalRewards =
-      _updateCurrentUnclaimedRewards(msg.sender, balanceOf(msg.sender), false);
+      _updateCurrentUnclaimedRewards(_msgSender(), balanceOf(_msgSender()), false);
     uint256 amountToClaim = (amount == type(uint256).max) ? newTotalRewards : amount;
 
-    stakerRewardsToClaim[msg.sender] = newTotalRewards.sub(amountToClaim, 'INVALID_AMOUNT');
+    stakerRewardsToClaim[_msgSender()] = newTotalRewards.sub(amountToClaim, 'INVALID_AMOUNT');
 
     REWARD_TOKEN.safeTransferFrom(REWARDS_VAULT, to, amountToClaim);
 
-    emit RewardsClaimed(msg.sender, to, amountToClaim);
+    emit RewardsClaimed(_msgSender(), to, amountToClaim);
   }
 
   /**
